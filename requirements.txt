@@ -1,0 +1,41 @@
+# Dependencias principales del Sistema de Ventas y Costos
+
+# Interfaz gráfica
+PyQt5==5.15.10
+PyQt5-Qt5==5.15.2
+PyQt5-sip==12.13.0
+
+# Base de datos
+PyMySQL==1.1.0
+cryptography==41.0.7
+
+# Manejo de datos
+python-decimal==0.1.0
+
+# Fechas y tiempo
+python-dateutil==2.8.2
+
+# Validaciones
+email-validator==2.1.0.post1
+
+# Reportes y PDF
+reportlab==4.0.7
+
+# Configuración
+python-dotenv==1.0.0
+
+# Testing
+pytest==7.4.3
+pytest-qt==4.2.0
+pytest-mock==3.12.0
+
+# Desarrollo
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Logging
+colorlog==6.8.0
+
+# Utilidades
+typing-extensions==4.8.0
