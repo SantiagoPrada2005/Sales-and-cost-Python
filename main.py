@@ -144,35 +144,20 @@ def main():
         
         logger.info("Conexión a la base de datos exitosa")
         
-        # TODO: Importar y mostrar ventana principal
-        # from views.main_window import MainWindow
-        # main_window = MainWindow()
-        # main_window.show()
+        # Importar y mostrar ventana principal
+        from views.main_window import MainWindow
         
-        # Por ahora, mostrar mensaje de que el entorno está listo
+        # Cerrar pantalla de carga
         splash.finish(None)
         
-        msg_box = QMessageBox()
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setWindowTitle("Entorno de Desarrollo")
-        msg_box.setText(f"""
-        ¡Entorno de desarrollo configurado correctamente!
+        # Crear y mostrar ventana principal
+        main_window = MainWindow()
+        main_window.show()
         
-        {APP_CONFIG['name']} v{APP_CONFIG['version']}
+        logger.info("Ventana principal mostrada exitosamente")
         
-        Próximos pasos:
-        1. Implementar los modelos de datos
-        2. Crear las vistas de la interfaz
-        3. Desarrollar los controladores
-        4. Configurar la base de datos
-        
-        La aplicación está lista para el desarrollo.
-        """)
-        msg_box.setStandardButtons(QMessageBox.Ok)
-        msg_box.exec_()
-        
-        logger.info("Entorno de desarrollo configurado exitosamente")
-        return 0
+        # Ejecutar el bucle principal de la aplicación
+        return app.exec_()
         
     except ConfigurationError as e:
         logger.error(f"Error de configuración: {e}")

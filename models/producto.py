@@ -155,10 +155,9 @@ class Producto(BaseModel):
         """
         try:
             query = f"SELECT * FROM {self.table_name} WHERE id = %s"
-            result = self.execute_query(query, (producto_id,))
+            productos = self.execute_query(query, (producto_id,), fetch_all=True)
             
-            if result and result.get('success') and result.get('data'):
-                productos = result['data']
+            if productos:
                 if productos:
                     producto = productos[0]
                     # Calcular margen de ganancia solo si los campos existen
@@ -196,10 +195,9 @@ class Producto(BaseModel):
         """
         try:
             query = f"SELECT * FROM {self.table_name} WHERE codigo_sku = %s"
-            result = self.execute_query(query, (codigo_sku,))
+            productos = self.execute_query(query, (codigo_sku,), fetch_all=True)
             
-            if result and result.get('success') and result.get('data'):
-                productos = result['data']
+            if productos:
                 if productos:
                     producto = productos[0]
                     # Calcular margen de ganancia solo si los campos existen
@@ -246,10 +244,9 @@ class Producto(BaseModel):
             
             query += f" ORDER BY {order_by}"
             
-            result = self.execute_query(query, params)
+            productos = self.execute_query(query, params, fetch_all=True)
             
-            if result and result.get('success') and result.get('data'):
-                productos = result['data']
+            if productos:
                 
                 # Formatear decimales y calcular margen solo si los campos existen
                 for producto in productos:
@@ -440,10 +437,9 @@ class Producto(BaseModel):
             query = f"SELECT * FROM {self.table_name} WHERE nombre LIKE %s OR codigo_sku LIKE %s OR descripcion LIKE %s ORDER BY nombre"
             params = (termino, termino, termino)
             
-            result = self.execute_query(query, params)
+            productos = self.execute_query(query, params, fetch_all=True)
             
-            if result and result.get('success') and result.get('data'):
-                productos = result['data']
+            if productos:
                 
                 # Formatear decimales y calcular margen solo si los campos existen
                 for producto in productos:
