@@ -925,6 +925,1015 @@ class FacturasView(QWidget):
 
 ---
 
+## Módulo de Cuentas Pendientes
+
+### Funcionalidades Principales
+- **Gestión de Cuentas por Cobrar**: Seguimiento de facturas pendientes de pago
+- **Registro de Pagos**: Aplicar pagos parciales o totales a facturas
+- **Estados de Cuenta**: Borrador, pendiente, pagada parcialmente, pagada, vencida
+- **Alertas de Vencimiento**: Notificaciones de facturas próximas a vencer
+- **Reportes de Cartera**: Análisis de cuentas por cobrar por cliente y antigüedad
+- **Gestión de Abonos**: Registro de pagos parciales con diferentes métodos de pago
+
+### Implementación del Modelo
+
+#### models/cuenta_pendiente.py
+```python
+from config.database import DatabaseConnection
+from utils.validators import CuentaPendienteValidator
+from utils.exceptions import CuentaPendienteError
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+class CuentaPendiente:
+    def __init__(self):
+        self.db = DatabaseConnection()
+        self.validator = CuentaPendienteValidator()
+    
+    def crear_desde_factura(self, factura_id):
+        """
+        Crear cuenta pendiente automáticamente desde una factura confirmada
+        
+        Args:
+            factura_id (int): ID de la factura
+            
+        Returns:
+            int: ID de la cuenta pendiente creada
+        """
+        # Obtener información de la factura
+        factura = self.obtener_factura(factura_id)
+        if not factura:
+            raise CuentaPendienteError("La factura especificada no existe")
+        
+        if factura['estado'] != 'confirmada':
+            raise CuentaPendienteError("Solo se pueden crear cuentas pendientes de facturas confirmadas")
+        
+        # Verificar si ya existe una cuenta pendiente para esta factura
+        cuenta_existente = self.obtener_por_factura(factura_id)
+        if cuenta_existente:
+            raise CuentaPendienteError("Ya existe una cuenta pendiente para esta factura")
+        
+        # Calcular fecha de vencimiento (30 días por defecto)
+        fecha_vencimiento = factura['fecha_factura'] + timedelta(days=30)
+        
+        query = """
+        INSERT INTO cuentas_pendientes (factura_id, cliente_id, monto_total, 
+                                      monto_pendiente, fecha_vencimiento, estado)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (
+                    factura_id, factura['cliente_id'], factura['total_factura'],
+                    factura['total_factura'], fecha_vencimiento, 'pendiente'
+                ))
+                conn.commit()
+                return cursor.lastrowid
+    
+    def registrar_pago(self, cuenta_id, monto_pago, metodo_pago, referencia=None, observaciones=None):
+        """
+        Registrar un pago para una cuenta pendiente
+        
+        Args:
+            cuenta_id (int): ID de la cuenta pendiente
+            monto_pago (Decimal): Monto del pago
+            metodo_pago (str): Método de pago (efectivo, transferencia, cheque, etc.)
+            referencia (str): Referencia del pago (número de cheque, transferencia, etc.)
+            observaciones (str): Observaciones adicionales
+            
+        Returns:
+            int: ID del pago registrado
+        """
+        # Validar datos del pago
+        self.validator.validar_pago(monto_pago, metodo_pago)
+        
+        # Obtener información de la cuenta
+        cuenta = self.obtener_por_id(cuenta_id)
+        if not cuenta:
+            raise CuentaPendienteError("La cuenta pendiente no existe")
+        
+        if cuenta['estado'] == 'pagada':
+            raise CuentaPendienteError("La cuenta ya está completamente pagada")
+        
+        # Validar que el monto no exceda lo pendiente
+        if monto_pago > cuenta['monto_pendiente']:
+            raise CuentaPendienteError(f"El monto del pago (${monto_pago}) excede el monto pendiente (${cuenta['monto_pendiente']})")
+        
+        # Registrar el pago
+        query_pago = """
+        INSERT INTO pagos (cuenta_pendiente_id, monto, metodo_pago, referencia, 
+                          fecha_pago, observaciones)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        
+        fecha_pago = datetime.now()
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query_pago, (
+                    cuenta_id, monto_pago, metodo_pago, referencia,
+                    fecha_pago, observaciones
+                ))
+                pago_id = cursor.lastrowid
+                
+                # Actualizar monto pendiente
+                nuevo_monto_pendiente = cuenta['monto_pendiente'] - monto_pago
+                
+                # Determinar nuevo estado
+                if nuevo_monto_pendiente == 0:
+                    nuevo_estado = 'pagada'
+                elif nuevo_monto_pendiente < cuenta['monto_total']:
+                    nuevo_estado = 'pagada_parcialmente'
+                else:
+                    nuevo_estado = cuenta['estado']
+                
+                # Actualizar cuenta pendiente
+                query_update = """
+                UPDATE cuentas_pendientes 
+                SET monto_pendiente = %s, estado = %s, fecha_ultimo_pago = %s
+                WHERE id = %s
+                """
+                
+                cursor.execute(query_update, (
+                    nuevo_monto_pendiente, nuevo_estado, fecha_pago, cuenta_id
+                ))
+                
+                conn.commit()
+                return pago_id
+    
+    def anular_pago(self, pago_id, motivo=None):
+        """
+        Anular un pago registrado
+        
+        Args:
+            pago_id (int): ID del pago a anular
+            motivo (str): Motivo de anulación
+        """
+        # Obtener información del pago
+        pago = self.obtener_pago_por_id(pago_id)
+        if not pago:
+            raise CuentaPendienteError("El pago especificado no existe")
+        
+        if pago['estado'] == 'anulado':
+            raise CuentaPendienteError("El pago ya está anulado")
+        
+        # Obtener cuenta pendiente
+        cuenta = self.obtener_por_id(pago['cuenta_pendiente_id'])
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                # Anular el pago
+                query_anular = """
+                UPDATE pagos 
+                SET estado = 'anulado', observaciones = CONCAT(COALESCE(observaciones, ''), %s)
+                WHERE id = %s
+                """
+                
+                motivo_texto = f"\n[ANULADO] {motivo}" if motivo else "\n[ANULADO]"
+                cursor.execute(query_anular, (motivo_texto, pago_id))
+                
+                # Recalcular monto pendiente
+                nuevo_monto_pendiente = cuenta['monto_pendiente'] + pago['monto']
+                
+                # Determinar nuevo estado
+                if nuevo_monto_pendiente == cuenta['monto_total']:
+                    nuevo_estado = 'pendiente'
+                elif nuevo_monto_pendiente < cuenta['monto_total']:
+                    nuevo_estado = 'pagada_parcialmente'
+                else:
+                    nuevo_estado = cuenta['estado']
+                
+                # Actualizar cuenta pendiente
+                query_update = """
+                UPDATE cuentas_pendientes 
+                SET monto_pendiente = %s, estado = %s
+                WHERE id = %s
+                """
+                
+                cursor.execute(query_update, (nuevo_monto_pendiente, nuevo_estado, cuenta['id']))
+                conn.commit()
+    
+    def obtener_por_id(self, cuenta_id):
+        """Obtener cuenta pendiente por ID"""
+        query = """
+        SELECT cp.*, c.nombre_completo as cliente_nombre, f.numero_factura
+        FROM cuentas_pendientes cp
+        JOIN clientes c ON cp.cliente_id = c.id
+        JOIN facturas f ON cp.factura_id = f.id
+        WHERE cp.id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (cuenta_id,))
+                return cursor.fetchone()
+    
+    def obtener_por_factura(self, factura_id):
+        """Obtener cuenta pendiente por factura"""
+        query = "SELECT * FROM cuentas_pendientes WHERE factura_id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id,))
+                return cursor.fetchone()
+    
+    def obtener_todas(self, filtros=None):
+        """
+        Obtener lista de cuentas pendientes con filtros opcionales
+        
+        Args:
+            filtros (dict): Filtros opcionales (cliente_id, estado, vencidas, etc.)
+        """
+        base_query = """
+        SELECT cp.*, c.nombre_completo as cliente_nombre, f.numero_factura,
+               CASE 
+                   WHEN cp.fecha_vencimiento < CURDATE() AND cp.estado != 'pagada' THEN 'vencida'
+                   ELSE cp.estado 
+               END as estado_actual,
+               DATEDIFF(CURDATE(), cp.fecha_vencimiento) as dias_vencimiento
+        FROM cuentas_pendientes cp
+        JOIN clientes c ON cp.cliente_id = c.id
+        JOIN facturas f ON cp.factura_id = f.id
+        WHERE 1=1
+        """
+        
+        params = []
+        
+        if filtros:
+            if filtros.get('cliente_id'):
+                base_query += " AND cp.cliente_id = %s"
+                params.append(filtros['cliente_id'])
+            
+            if filtros.get('estado'):
+                if filtros['estado'] == 'vencida':
+                    base_query += " AND cp.fecha_vencimiento < CURDATE() AND cp.estado != 'pagada'"
+                else:
+                    base_query += " AND cp.estado = %s"
+                    params.append(filtros['estado'])
+            
+            if filtros.get('fecha_desde'):
+                base_query += " AND cp.fecha_creacion >= %s"
+                params.append(filtros['fecha_desde'])
+            
+            if filtros.get('fecha_hasta'):
+                base_query += " AND cp.fecha_creacion <= %s"
+                params.append(filtros['fecha_hasta'])
+            
+            if filtros.get('solo_pendientes'):
+                base_query += " AND cp.estado IN ('pendiente', 'pagada_parcialmente')"
+        
+        base_query += " ORDER BY cp.fecha_vencimiento ASC, cp.id DESC"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(base_query, params)
+                return cursor.fetchall()
+    
+    def obtener_por_cliente(self, cliente_id):
+        """Obtener cuentas pendientes de un cliente específico"""
+        filtros = {'cliente_id': cliente_id, 'solo_pendientes': True}
+        return self.obtener_todas(filtros)
+    
+    def obtener_vencidas(self):
+        """Obtener cuentas vencidas"""
+        filtros = {'estado': 'vencida'}
+        return self.obtener_todas(filtros)
+    
+    def obtener_proximas_vencer(self, dias=7):
+        """
+        Obtener cuentas próximas a vencer
+        
+        Args:
+            dias (int): Días de anticipación para considerar próximas a vencer
+        """
+        query = """
+        SELECT cp.*, c.nombre_completo as cliente_nombre, f.numero_factura,
+               DATEDIFF(cp.fecha_vencimiento, CURDATE()) as dias_para_vencer
+        FROM cuentas_pendientes cp
+        JOIN clientes c ON cp.cliente_id = c.id
+        JOIN facturas f ON cp.factura_id = f.id
+        WHERE cp.estado IN ('pendiente', 'pagada_parcialmente')
+        AND cp.fecha_vencimiento BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL %s DAY)
+        ORDER BY cp.fecha_vencimiento ASC
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (dias,))
+                return cursor.fetchall()
+    
+    def obtener_pagos(self, cuenta_id):
+        """Obtener historial de pagos de una cuenta"""
+        query = """
+        SELECT * FROM pagos 
+        WHERE cuenta_pendiente_id = %s AND estado != 'anulado'
+        ORDER BY fecha_pago DESC
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (cuenta_id,))
+                return cursor.fetchall()
+    
+    def obtener_pago_por_id(self, pago_id):
+        """Obtener información de un pago específico"""
+        query = "SELECT * FROM pagos WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (pago_id,))
+                return cursor.fetchone()
+    
+    def obtener_factura(self, factura_id):
+        """Obtener información de una factura"""
+        query = "SELECT * FROM facturas WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id,))
+                return cursor.fetchone()
+    
+    def obtener_estadisticas_cartera(self):
+        """
+        Obtener estadísticas generales de la cartera
+        
+        Returns:
+            dict: Estadísticas de cuentas por cobrar
+        """
+        query = """
+        SELECT 
+            COUNT(*) as total_cuentas,
+            COALESCE(SUM(monto_total), 0) as monto_total_cartera,
+            COALESCE(SUM(monto_pendiente), 0) as monto_pendiente_total,
+            COALESCE(SUM(CASE WHEN estado = 'pendiente' THEN monto_pendiente ELSE 0 END), 0) as pendiente_sin_pagar,
+            COALESCE(SUM(CASE WHEN estado = 'pagada_parcialmente' THEN monto_pendiente ELSE 0 END), 0) as pendiente_parcial,
+            COALESCE(SUM(CASE WHEN fecha_vencimiento < CURDATE() AND estado != 'pagada' THEN monto_pendiente ELSE 0 END), 0) as monto_vencido,
+            COUNT(CASE WHEN fecha_vencimiento < CURDATE() AND estado != 'pagada' THEN 1 END) as cuentas_vencidas,
+            COUNT(CASE WHEN estado = 'pagada' THEN 1 END) as cuentas_pagadas
+        FROM cuentas_pendientes
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                return cursor.fetchone()
+    
+    def obtener_resumen_por_cliente(self):
+        """Obtener resumen de cartera por cliente"""
+        query = """
+        SELECT 
+            c.id as cliente_id,
+            c.nombre_completo as cliente_nombre,
+            COUNT(cp.id) as total_cuentas,
+            COALESCE(SUM(cp.monto_total), 0) as monto_total,
+            COALESCE(SUM(cp.monto_pendiente), 0) as monto_pendiente,
+            COUNT(CASE WHEN cp.fecha_vencimiento < CURDATE() AND cp.estado != 'pagada' THEN 1 END) as cuentas_vencidas,
+            COALESCE(SUM(CASE WHEN cp.fecha_vencimiento < CURDATE() AND cp.estado != 'pagada' THEN cp.monto_pendiente ELSE 0 END), 0) as monto_vencido
+        FROM clientes c
+        LEFT JOIN cuentas_pendientes cp ON c.id = cp.cliente_id
+        WHERE cp.estado IN ('pendiente', 'pagada_parcialmente')
+        GROUP BY c.id, c.nombre_completo
+        HAVING monto_pendiente > 0
+        ORDER BY monto_pendiente DESC
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                return cursor.fetchall()
+    
+    def obtener_antiguedad_saldos(self):
+        """
+        Obtener análisis de antigüedad de saldos
+        
+        Returns:
+            dict: Análisis por rangos de días vencidos
+        """
+        query = """
+        SELECT 
+            SUM(CASE WHEN DATEDIFF(CURDATE(), fecha_vencimiento) <= 0 THEN monto_pendiente ELSE 0 END) as corriente,
+            SUM(CASE WHEN DATEDIFF(CURDATE(), fecha_vencimiento) BETWEEN 1 AND 30 THEN monto_pendiente ELSE 0 END) as vencido_1_30,
+            SUM(CASE WHEN DATEDIFF(CURDATE(), fecha_vencimiento) BETWEEN 31 AND 60 THEN monto_pendiente ELSE 0 END) as vencido_31_60,
+            SUM(CASE WHEN DATEDIFF(CURDATE(), fecha_vencimiento) BETWEEN 61 AND 90 THEN monto_pendiente ELSE 0 END) as vencido_61_90,
+            SUM(CASE WHEN DATEDIFF(CURDATE(), fecha_vencimiento) > 90 THEN monto_pendiente ELSE 0 END) as vencido_mas_90
+        FROM cuentas_pendientes
+        WHERE estado IN ('pendiente', 'pagada_parcialmente')
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                return cursor.fetchone()
+    
+    def actualizar_estados_vencimiento(self):
+        """
+        Actualizar automáticamente los estados de cuentas vencidas
+        Este método debe ejecutarse diariamente
+        """
+        query = """
+        UPDATE cuentas_pendientes 
+        SET estado = 'vencida'
+        WHERE fecha_vencimiento < CURDATE() 
+        AND estado IN ('pendiente', 'pagada_parcialmente')
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                filas_afectadas = cursor.rowcount
+                conn.commit()
+                return filas_afectadas
+```
+
+### Implementación del Controlador
+
+#### controllers/cuenta_pendiente_controller.py
+```python
+from models.cuenta_pendiente import CuentaPendiente
+from utils.exceptions import CuentaPendienteError
+from PyQt5.QtCore import QObject, pyqtSignal
+
+class CuentaPendienteController(QObject):
+    # Señales para comunicación con la vista
+    cuenta_creada = pyqtSignal(dict)
+    pago_registrado = pyqtSignal(dict)
+    pago_anulado = pyqtSignal(int)
+    cuenta_actualizada = pyqtSignal(dict)
+    error_ocurrido = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.modelo = CuentaPendiente()
+    
+    def crear_cuenta_desde_factura(self, factura_id):
+        """Crear cuenta pendiente desde factura"""
+        try:
+            cuenta_id = self.modelo.crear_desde_factura(factura_id)
+            cuenta_creada = self.modelo.obtener_por_id(cuenta_id)
+            self.cuenta_creada.emit(cuenta_creada)
+            return cuenta_id
+            
+        except CuentaPendienteError as e:
+            self.error_ocurrido.emit(str(e))
+            return None
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+            return None
+    
+    def registrar_pago(self, cuenta_id, monto_pago, metodo_pago, referencia=None, observaciones=None):
+        """Registrar pago para una cuenta"""
+        try:
+            pago_id = self.modelo.registrar_pago(cuenta_id, monto_pago, metodo_pago, referencia, observaciones)
+            
+            # Obtener información del pago registrado
+            pago = self.modelo.obtener_pago_por_id(pago_id)
+            self.pago_registrado.emit(pago)
+            
+            # Emitir señal de cuenta actualizada
+            cuenta_actualizada = self.modelo.obtener_por_id(cuenta_id)
+            self.cuenta_actualizada.emit(cuenta_actualizada)
+            
+            return pago_id
+            
+        except CuentaPendienteError as e:
+            self.error_ocurrido.emit(str(e))
+            return None
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+            return None
+    
+    def anular_pago(self, pago_id, motivo=None):
+        """Anular un pago"""
+        try:
+            # Obtener información del pago antes de anularlo
+            pago = self.modelo.obtener_pago_por_id(pago_id)
+            if not pago:
+                self.error_ocurrido.emit("El pago no existe")
+                return
+            
+            cuenta_id = pago['cuenta_pendiente_id']
+            
+            self.modelo.anular_pago(pago_id, motivo)
+            self.pago_anulado.emit(pago_id)
+            
+            # Emitir señal de cuenta actualizada
+            cuenta_actualizada = self.modelo.obtener_por_id(cuenta_id)
+            self.cuenta_actualizada.emit(cuenta_actualizada)
+            
+        except CuentaPendienteError as e:
+            self.error_ocurrido.emit(str(e))
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+    
+    def obtener_cuentas(self, filtros=None):
+        """Obtener lista de cuentas pendientes"""
+        try:
+            return self.modelo.obtener_todas(filtros)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener cuentas: {str(e)}")
+            return []
+    
+    def obtener_cuenta(self, cuenta_id):
+        """Obtener cuenta específica"""
+        try:
+            return self.modelo.obtener_por_id(cuenta_id)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener cuenta: {str(e)}")
+            return None
+    
+    def obtener_cuentas_cliente(self, cliente_id):
+        """Obtener cuentas de un cliente"""
+        try:
+            return self.modelo.obtener_por_cliente(cliente_id)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener cuentas del cliente: {str(e)}")
+            return []
+    
+    def obtener_cuentas_vencidas(self):
+        """Obtener cuentas vencidas"""
+        try:
+            return self.modelo.obtener_vencidas()
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener cuentas vencidas: {str(e)}")
+            return []
+    
+    def obtener_proximas_vencer(self, dias=7):
+        """Obtener cuentas próximas a vencer"""
+        try:
+            return self.modelo.obtener_proximas_vencer(dias)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener cuentas próximas a vencer: {str(e)}")
+            return []
+    
+    def obtener_pagos_cuenta(self, cuenta_id):
+        """Obtener historial de pagos de una cuenta"""
+        try:
+            return self.modelo.obtener_pagos(cuenta_id)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener pagos: {str(e)}")
+            return []
+    
+    def obtener_estadisticas_cartera(self):
+        """Obtener estadísticas de cartera"""
+        try:
+            return self.modelo.obtener_estadisticas_cartera()
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener estadísticas: {str(e)}")
+            return None
+    
+    def obtener_resumen_por_cliente(self):
+        """Obtener resumen por cliente"""
+        try:
+            return self.modelo.obtener_resumen_por_cliente()
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener resumen por cliente: {str(e)}")
+            return []
+    
+    def obtener_antiguedad_saldos(self):
+        """Obtener análisis de antigüedad de saldos"""
+        try:
+            return self.modelo.obtener_antiguedad_saldos()
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener antigüedad de saldos: {str(e)}")
+            return None
+    
+    def actualizar_estados_vencimiento(self):
+        """Actualizar estados de vencimiento"""
+        try:
+            filas_afectadas = self.modelo.actualizar_estados_vencimiento()
+            return filas_afectadas
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al actualizar estados: {str(e)}")
+            return 0
+```
+
+### Implementación de la Vista Principal
+
+#### views/cuentas_pendientes_view.py
+```python
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+                            QTableWidget, QTableWidgetItem, QLineEdit, QLabel,
+                            QComboBox, QDateEdit, QMessageBox, QHeaderView,
+                            QAbstractItemView, QGroupBox, QFormLayout, QTabWidget)
+from PyQt5.QtCore import Qt, pyqtSlot, QDate, QTimer
+from PyQt5.QtGui import QColor
+from controllers.cuenta_pendiente_controller import CuentaPendienteController
+from views.pago_dialog import PagoDialog
+from views.estadisticas_cartera_dialog import EstadisticasCarteraDialog
+
+class CuentasPendientesView(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.controller = CuentaPendienteController()
+        self.setup_ui()
+        self.conectar_senales()
+        self.cargar_cuentas()
+        
+        # Timer para actualizar estados automáticamente
+        self.timer_actualizacion = QTimer()
+        self.timer_actualizacion.timeout.connect(self.actualizar_estados_vencimiento)
+        self.timer_actualizacion.start(3600000)  # Cada hora
+    
+    def setup_ui(self):
+        """Configurar interfaz de usuario"""
+        layout = QVBoxLayout()
+        
+        # Pestañas principales
+        self.tabs = QTabWidget()
+        
+        # Pestaña de cuentas pendientes
+        tab_cuentas = QWidget()
+        self.setup_tab_cuentas(tab_cuentas)
+        self.tabs.addTab(tab_cuentas, "Cuentas Pendientes")
+        
+        # Pestaña de alertas
+        tab_alertas = QWidget()
+        self.setup_tab_alertas(tab_alertas)
+        self.tabs.addTab(tab_alertas, "Alertas")
+        
+        layout.addWidget(self.tabs)
+        self.setLayout(layout)
+    
+    def setup_tab_cuentas(self, tab):
+        """Configurar pestaña de cuentas pendientes"""
+        layout = QVBoxLayout()
+        
+        # Filtros
+        filtros_group = QGroupBox("Filtros de Búsqueda")
+        filtros_layout = QFormLayout()
+        
+        self.combo_estado = QComboBox()
+        self.combo_estado.addItems(['Todos', 'Pendiente', 'Pagada Parcialmente', 'Pagada', 'Vencida'])
+        
+        self.combo_cliente = QComboBox()
+        self.combo_cliente.addItem("Todos los clientes", None)
+        self.cargar_clientes()
+        
+        self.date_desde = QDateEdit()
+        self.date_desde.setDate(QDate.currentDate().addDays(-30))
+        self.date_desde.setCalendarPopup(True)
+        
+        self.date_hasta = QDateEdit()
+        self.date_hasta.setDate(QDate.currentDate())
+        self.date_hasta.setCalendarPopup(True)
+        
+        self.btn_filtrar = QPushButton("Filtrar")
+        self.btn_limpiar_filtros = QPushButton("Limpiar")
+        
+        filtros_layout.addRow("Estado:", self.combo_estado)
+        filtros_layout.addRow("Cliente:", self.combo_cliente)
+        filtros_layout.addRow("Desde:", self.date_desde)
+        filtros_layout.addRow("Hasta:", self.date_hasta)
+        
+        botones_filtros = QHBoxLayout()
+        botones_filtros.addWidget(self.btn_filtrar)
+        botones_filtros.addWidget(self.btn_limpiar_filtros)
+        botones_filtros.addStretch()
+        
+        filtros_layout.addRow("", botones_filtros)
+        filtros_group.setLayout(filtros_layout)
+        
+        # Barra de herramientas
+        toolbar_layout = QHBoxLayout()
+        
+        self.btn_registrar_pago = QPushButton("Registrar Pago")
+        self.btn_ver_pagos = QPushButton("Ver Pagos")
+        self.btn_estadisticas = QPushButton("Estadísticas")
+        self.btn_actualizar = QPushButton("Actualizar")
+        
+        toolbar_layout.addWidget(self.btn_registrar_pago)
+        toolbar_layout.addWidget(self.btn_ver_pagos)
+        toolbar_layout.addWidget(self.btn_estadisticas)
+        toolbar_layout.addWidget(self.btn_actualizar)
+        toolbar_layout.addStretch()
+        
+        # Tabla de cuentas
+        self.tabla_cuentas = QTableWidget()
+        self.configurar_tabla_cuentas()
+        
+        # Layout de la pestaña
+        layout.addWidget(filtros_group)
+        layout.addLayout(toolbar_layout)
+        layout.addWidget(self.tabla_cuentas)
+        
+        tab.setLayout(layout)
+        
+        # Estado inicial de botones
+        self.btn_registrar_pago.setEnabled(False)
+        self.btn_ver_pagos.setEnabled(False)
+    
+    def setup_tab_alertas(self, tab):
+        """Configurar pestaña de alertas"""
+        layout = QVBoxLayout()
+        
+        # Título
+        titulo = QLabel("Alertas de Vencimiento")
+        titulo.setStyleSheet("font-size: 16px; font-weight: bold; margin: 10px;")
+        
+        # Tabla de cuentas próximas a vencer
+        self.tabla_alertas = QTableWidget()
+        self.configurar_tabla_alertas()
+        
+        layout.addWidget(titulo)
+        layout.addWidget(self.tabla_alertas)
+        
+        tab.setLayout(layout)
+    
+    def configurar_tabla_cuentas(self):
+        """Configurar tabla de cuentas pendientes"""
+        columnas = ['ID', 'Factura', 'Cliente', 'Monto Total', 'Monto Pendiente', 
+                   'Fecha Vencimiento', 'Días Vencimiento', 'Estado']
+        self.tabla_cuentas.setColumnCount(len(columnas))
+        self.tabla_cuentas.setHorizontalHeaderLabels(columnas)
+        
+        # Configurar comportamiento
+        self.tabla_cuentas.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tabla_cuentas.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tabla_cuentas.setAlternatingRowColors(True)
+        
+        # Ajustar columnas
+        header = self.tabla_cuentas.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # ID
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Factura
+        header.setSectionResizeMode(2, QHeaderView.Stretch)           # Cliente
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Monto Total
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Monto Pendiente
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Fecha Vencimiento
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Días Vencimiento
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # Estado
+        
+        # Ocultar columna ID
+        self.tabla_cuentas.setColumnHidden(0, True)
+    
+    def configurar_tabla_alertas(self):
+        """Configurar tabla de alertas"""
+        columnas = ['Factura', 'Cliente', 'Monto Pendiente', 'Días para Vencer', 'Estado']
+        self.tabla_alertas.setColumnCount(len(columnas))
+        self.tabla_alertas.setHorizontalHeaderLabels(columnas)
+        
+        # Configurar comportamiento
+        self.tabla_alertas.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tabla_alertas.setAlternatingRowColors(True)
+        
+        # Ajustar columnas
+        header = self.tabla_alertas.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Factura
+        header.setSectionResizeMode(1, QHeaderView.Stretch)           # Cliente
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Monto Pendiente
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Días para Vencer
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Estado
+    
+    def conectar_senales(self):
+        """Conectar señales y slots"""
+        # Botones
+        self.btn_registrar_pago.clicked.connect(self.registrar_pago)
+        self.btn_ver_pagos.clicked.connect(self.ver_pagos)
+        self.btn_estadisticas.clicked.connect(self.mostrar_estadisticas)
+        self.btn_actualizar.clicked.connect(self.cargar_cuentas)
+        
+        # Filtros
+        self.btn_filtrar.clicked.connect(self.aplicar_filtros)
+        self.btn_limpiar_filtros.clicked.connect(self.limpiar_filtros)
+        
+        # Tabla
+        self.tabla_cuentas.itemSelectionChanged.connect(self.seleccion_cambiada)
+        self.tabla_cuentas.itemDoubleClicked.connect(self.ver_pagos)
+        
+        # Pestañas
+        self.tabs.currentChanged.connect(self.cambio_pestana)
+        
+        # Señales del controlador
+        self.controller.cuenta_creada.connect(self.on_cuenta_creada)
+        self.controller.pago_registrado.connect(self.on_pago_registrado)
+        self.controller.cuenta_actualizada.connect(self.on_cuenta_actualizada)
+        self.controller.error_ocurrido.connect(self.mostrar_error)
+    
+    def cargar_cuentas(self):
+        """Cargar cuentas pendientes en la tabla"""
+        filtros = self.obtener_filtros()
+        cuentas = self.controller.obtener_cuentas(filtros)
+        
+        self.tabla_cuentas.setRowCount(len(cuentas))
+        
+        for row, cuenta in enumerate(cuentas):
+            # Determinar estado visual
+            estado_visual = cuenta.get('estado_actual', cuenta['estado'])
+            dias_vencimiento = cuenta.get('dias_vencimiento', 0)
+            
+            items = [
+                str(cuenta['id']),
+                cuenta['numero_factura'],
+                cuenta['cliente_nombre'],
+                f"${cuenta['monto_total']:.2f}",
+                f"${cuenta['monto_pendiente']:.2f}",
+                cuenta['fecha_vencimiento'].strftime('%Y-%m-%d'),
+                str(dias_vencimiento) if dias_vencimiento > 0 else "No vencida",
+                estado_visual.replace('_', ' ').title()
+            ]
+            
+            for col, item in enumerate(items):
+                table_item = QTableWidgetItem(str(item))
+                table_item.setFlags(table_item.flags() & ~Qt.ItemIsEditable)
+                
+                # Colorear según estado
+                if estado_visual == 'vencida':
+                    table_item.setBackground(QColor(255, 200, 200))  # Rojo claro
+                elif estado_visual == 'pagada_parcialmente':
+                    table_item.setBackground(QColor(255, 255, 200))  # Amarillo claro
+                elif estado_visual == 'pagada':
+                    table_item.setBackground(QColor(200, 255, 200))  # Verde claro
+                elif dias_vencimiento < 0 and dias_vencimiento >= -7:
+                    table_item.setBackground(QColor(255, 220, 150))  # Naranja claro
+                
+                self.tabla_cuentas.setItem(row, col, table_item)
+    
+    def cargar_alertas(self):
+        """Cargar alertas de vencimiento"""
+        # Cuentas próximas a vencer (7 días)
+        proximas_vencer = self.controller.obtener_proximas_vencer(7)
+        
+        # Cuentas vencidas
+        vencidas = self.controller.obtener_cuentas_vencidas()
+        
+        # Combinar ambas listas
+        alertas = proximas_vencer + vencidas
+        
+        self.tabla_alertas.setRowCount(len(alertas))
+        
+        for row, cuenta in enumerate(alertas):
+            dias_para_vencer = cuenta.get('dias_para_vencer', cuenta.get('dias_vencimiento', 0))
+            
+            if dias_para_vencer is not None and dias_para_vencer > 0:
+                estado_texto = f"Vence en {dias_para_vencer} días"
+                color_fondo = QColor(255, 220, 150)  # Naranja claro
+            else:
+                dias_vencida = abs(dias_para_vencer) if dias_para_vencer else 0
+                estado_texto = f"Vencida hace {dias_vencida} días" if dias_vencida > 0 else "Vencida"
+                color_fondo = QColor(255, 200, 200)  # Rojo claro
+            
+            items = [
+                cuenta['numero_factura'],
+                cuenta['cliente_nombre'],
+                f"${cuenta['monto_pendiente']:.2f}",
+                str(abs(dias_para_vencer)) if dias_para_vencer else "0",
+                estado_texto
+            ]
+            
+            for col, item in enumerate(items):
+                table_item = QTableWidgetItem(str(item))
+                table_item.setFlags(table_item.flags() & ~Qt.ItemIsEditable)
+                table_item.setBackground(color_fondo)
+                self.tabla_alertas.setItem(row, col, table_item)
+    
+    def cargar_clientes(self):
+        """Cargar lista de clientes en el combo"""
+        # TODO: Implementar carga de clientes desde el controlador de clientes
+        pass
+    
+    def obtener_filtros(self):
+        """Obtener filtros actuales"""
+        filtros = {}
+        
+        if self.combo_estado.currentText() != 'Todos':
+            estado_map = {
+                'Pendiente': 'pendiente',
+                'Pagada Parcialmente': 'pagada_parcialmente',
+                'Pagada': 'pagada',
+                'Vencida': 'vencida'
+            }
+            filtros['estado'] = estado_map.get(self.combo_estado.currentText())
+        
+        cliente_id = self.combo_cliente.currentData()
+        if cliente_id:
+            filtros['cliente_id'] = cliente_id
+        
+        filtros['fecha_desde'] = self.date_desde.date().toPyDate()
+        filtros['fecha_hasta'] = self.date_hasta.date().toPyDate()
+        
+        return filtros
+    
+    def seleccion_cambiada(self):
+        """Manejar cambio de selección"""
+        tiene_seleccion = len(self.tabla_cuentas.selectedItems()) > 0
+        self.btn_registrar_pago.setEnabled(tiene_seleccion)
+        self.btn_ver_pagos.setEnabled(tiene_seleccion)
+    
+    def obtener_cuenta_seleccionada(self):
+        """Obtener ID de cuenta seleccionada"""
+        fila_actual = self.tabla_cuentas.currentRow()
+        if fila_actual >= 0:
+            return int(self.tabla_cuentas.item(fila_actual, 0).text())
+        return None
+    
+    def registrar_pago(self):
+        """Registrar pago para cuenta seleccionada"""
+        cuenta_id = self.obtener_cuenta_seleccionada()
+        if cuenta_id:
+            dialogo = PagoDialog(self, cuenta_id)
+            dialogo.exec_()
+    
+    def ver_pagos(self):
+        """Ver historial de pagos de cuenta seleccionada"""
+        cuenta_id = self.obtener_cuenta_seleccionada()
+        if cuenta_id:
+            # TODO: Implementar diálogo de historial de pagos
+            QMessageBox.information(self, "Información", "Función de historial de pagos en desarrollo")
+    
+    def mostrar_estadisticas(self):
+        """Mostrar estadísticas de cartera"""
+        dialogo = EstadisticasCarteraDialog(self)
+        dialogo.exec_()
+    
+    def aplicar_filtros(self):
+        """Aplicar filtros de búsqueda"""
+        self.cargar_cuentas()
+    
+    def limpiar_filtros(self):
+        """Limpiar filtros de búsqueda"""
+        self.combo_estado.setCurrentIndex(0)
+        self.combo_cliente.setCurrentIndex(0)
+        self.date_desde.setDate(QDate.currentDate().addDays(-30))
+        self.date_hasta.setDate(QDate.currentDate())
+        self.cargar_cuentas()
+    
+    def cambio_pestana(self, index):
+        """Manejar cambio de pestaña"""
+        if index == 1:  # Pestaña de alertas
+            self.cargar_alertas()
+    
+    def actualizar_estados_vencimiento(self):
+        """Actualizar estados de vencimiento automáticamente"""
+        filas_afectadas = self.controller.actualizar_estados_vencimiento()
+        if filas_afectadas > 0:
+            self.cargar_cuentas()
+            if self.tabs.currentIndex() == 1:
+                self.cargar_alertas()
+    
+    @pyqtSlot(dict)
+    def on_cuenta_creada(self, cuenta):
+        """Manejar cuenta creada"""
+        QMessageBox.information(self, "Éxito", "Cuenta pendiente creada correctamente")
+        self.cargar_cuentas()
+    
+    @pyqtSlot(dict)
+    def on_pago_registrado(self, pago):
+        """Manejar pago registrado"""
+        QMessageBox.information(self, "Éxito", "Pago registrado correctamente")
+        self.cargar_cuentas()
+    
+    @pyqtSlot(dict)
+    def on_cuenta_actualizada(self, cuenta):
+        """Manejar cuenta actualizada"""
+        self.cargar_cuentas()
+    
+    @pyqtSlot(str)
+    def mostrar_error(self, mensaje):
+        """Mostrar mensaje de error"""
+        QMessageBox.critical(self, "Error", mensaje)
+```
+
+### Validaciones Específicas
+
+#### Agregar a utils/validators.py
+```python
+class CuentaPendienteValidator:
+    def validar_pago(self, monto, metodo_pago):
+        """
+        Validar datos de un pago
+        
+        Args:
+            monto (Decimal): Monto del pago
+            metodo_pago (str): Método de pago
+        """
+        if not monto or monto <= 0:
+            raise ValueError("El monto del pago debe ser mayor a cero")
+        
+        if not metodo_pago or not metodo_pago.strip():
+            raise ValueError("Debe especificar el método de pago")
+        
+        metodos_validos = ['efectivo', 'transferencia', 'cheque', 'tarjeta_credito', 'tarjeta_debito']
+        if metodo_pago.lower() not in metodos_validos:
+            raise ValueError(f"Método de pago no válido. Métodos permitidos: {', '.join(metodos_validos)}")
+
+class FacturaValidator:
+    def validar_detalle_factura(self, cantidad, precio_unitario):
+        """
+        Validar detalle de factura
+        
+        Args:
+            cantidad (int): Cantidad del producto
+            precio_unitario (Decimal): Precio unitario
+        """
+        if not cantidad or cantidad <= 0:
+            raise ValueError("La cantidad debe ser mayor a cero")
+        
+        if not precio_unitario or precio_unitario <= 0:
+            raise ValueError("El precio unitario debe ser mayor a cero")
+```
+
+---
+
 ## Configuración del Entorno de Desarrollo
 
 ### Requisitos Previos
