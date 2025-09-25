@@ -8,7 +8,7 @@ import os
 from unittest.mock import Mock, patch
 
 # Agregar el directorio raíz al path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def test_main_imports():
     """Probar que main.py puede importar todas sus dependencias"""

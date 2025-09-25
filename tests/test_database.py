@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Agregar el directorio raíz al path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.database import DatabaseConnection
 from config.settings import DATABASE_CONFIG

@@ -7,7 +7,7 @@ import sys
 import os
 
 # Agregar el directorio raíz al path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def test_base_model_import():
     """Probar que el BaseModel se puede importar correctamente"""

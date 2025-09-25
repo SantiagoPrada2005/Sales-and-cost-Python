@@ -9,7 +9,7 @@ from decimal import Decimal
 from datetime import datetime, date
 
 # Agregar el directorio raíz al path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.exceptions import *
 from utils.validators import *
