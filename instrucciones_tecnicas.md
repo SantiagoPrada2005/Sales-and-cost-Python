@@ -11,6 +11,920 @@
 
 ---
 
+## Módulo de Facturación y Ventas
+
+### Funcionalidades Principales
+- **Crear Factura**: Generación de nuevas facturas con productos y clientes
+- **Gestión de Detalles**: Agregar/quitar productos de la factura
+- **Cálculos Automáticos**: Subtotales, impuestos y totales
+- **Estados de Factura**: Borrador, confirmada, pagada, anulada
+- **Impresión/Exportación**: Generar PDF de facturas
+- **Búsqueda y Filtros**: Por cliente, fecha, estado, número
+
+### Implementación del Modelo
+
+#### models/factura.py
+```python
+from config.database import DatabaseConnection
+from utils.validators import FacturaValidator
+from utils.exceptions import FacturaError
+from datetime import datetime
+from decimal import Decimal
+
+class Factura:
+    def __init__(self):
+        self.db = DatabaseConnection()
+        self.validator = FacturaValidator()
+    
+    def crear(self, cliente_id, observaciones=None):
+        """
+        Crear una nueva factura en estado borrador
+        
+        Args:
+            cliente_id (int): ID del cliente
+            observaciones (str): Observaciones opcionales
+            
+        Returns:
+            int: ID de la factura creada
+        """
+        # Validar que el cliente existe
+        if not self.cliente_existe(cliente_id):
+            raise FacturaError("El cliente especificado no existe")
+        
+        # Generar número de factura
+        numero_factura = self.generar_numero_factura()
+        
+        query = """
+        INSERT INTO facturas (numero_factura, cliente_id, fecha_factura, 
+                            subtotal_factura, impuestos_factura, total_factura, 
+                            estado, observaciones)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        fecha_actual = datetime.now()
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (
+                    numero_factura, cliente_id, fecha_actual,
+                    Decimal('0.00'), Decimal('0.00'), Decimal('0.00'),
+                    'borrador', observaciones
+                ))
+                conn.commit()
+                return cursor.lastrowid
+    
+    def agregar_detalle(self, factura_id, producto_id, cantidad, precio_unitario=None):
+        """
+        Agregar un producto a la factura
+        
+        Args:
+            factura_id (int): ID de la factura
+            producto_id (int): ID del producto
+            cantidad (int): Cantidad del producto
+            precio_unitario (Decimal): Precio unitario (opcional, toma del producto si no se especifica)
+        """
+        # Validar que la factura existe y está en borrador
+        factura = self.obtener_por_id(factura_id)
+        if not factura:
+            raise FacturaError("La factura no existe")
+        
+        if factura['estado'] != 'borrador':
+            raise FacturaError("Solo se pueden modificar facturas en estado borrador")
+        
+        # Obtener información del producto
+        producto = self.obtener_producto(producto_id)
+        if not producto:
+            raise FacturaError("El producto especificado no existe")
+        
+        # Usar precio del producto si no se especifica
+        if precio_unitario is None:
+            precio_unitario = producto['precio_venta']
+        
+        # Validar cantidad y precio
+        self.validator.validar_detalle_factura(cantidad, precio_unitario)
+        
+        # Verificar stock disponible
+        if producto['stock_actual'] < cantidad:
+            raise FacturaError(f"Stock insuficiente. Disponible: {producto['stock_actual']}")
+        
+        # Verificar si el producto ya está en la factura
+        detalle_existente = self.obtener_detalle_producto(factura_id, producto_id)
+        
+        if detalle_existente:
+            # Actualizar cantidad existente
+            nueva_cantidad = detalle_existente['cantidad'] + cantidad
+            self.actualizar_detalle(detalle_existente['id'], nueva_cantidad, precio_unitario)
+        else:
+            # Crear nuevo detalle
+            query = """
+            INSERT INTO factura_detalles (factura_id, producto_id, cantidad, 
+                                        precio_unitario, subtotal)
+            VALUES (%s, %s, %s, %s, %s)
+            """
+            
+            subtotal = Decimal(str(cantidad)) * Decimal(str(precio_unitario))
+            
+            with self.db.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(query, (factura_id, producto_id, cantidad, 
+                                         precio_unitario, subtotal))
+                    conn.commit()
+        
+        # Recalcular totales de la factura
+        self.recalcular_totales(factura_id)
+    
+    def actualizar_detalle(self, detalle_id, cantidad, precio_unitario):
+        """Actualizar un detalle de factura existente"""
+        self.validator.validar_detalle_factura(cantidad, precio_unitario)
+        
+        subtotal = Decimal(str(cantidad)) * Decimal(str(precio_unitario))
+        
+        query = """
+        UPDATE factura_detalles 
+        SET cantidad = %s, precio_unitario = %s, subtotal = %s
+        WHERE id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (cantidad, precio_unitario, subtotal, detalle_id))
+                conn.commit()
+    
+    def eliminar_detalle(self, detalle_id):
+        """
+        Eliminar un detalle de factura
+        
+        Args:
+            detalle_id (int): ID del detalle a eliminar
+        """
+        # Obtener información del detalle para validaciones
+        detalle = self.obtener_detalle_por_id(detalle_id)
+        if not detalle:
+            raise FacturaError("El detalle de factura no existe")
+        
+        # Validar que la factura esté en borrador
+        factura = self.obtener_por_id(detalle['factura_id'])
+        if factura['estado'] != 'borrador':
+            raise FacturaError("Solo se pueden modificar facturas en estado borrador")
+        
+        query = "DELETE FROM factura_detalles WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (detalle_id,))
+                conn.commit()
+        
+        # Recalcular totales
+        self.recalcular_totales(detalle['factura_id'])
+    
+    def recalcular_totales(self, factura_id):
+        """
+        Recalcular los totales de una factura basado en sus detalles
+        
+        Args:
+            factura_id (int): ID de la factura
+        """
+        # Obtener suma de subtotales
+        query = """
+        SELECT COALESCE(SUM(subtotal), 0) as subtotal_total
+        FROM factura_detalles
+        WHERE factura_id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id,))
+                result = cursor.fetchone()
+                subtotal = result['subtotal_total']
+        
+        # Calcular impuestos (19% IVA por defecto)
+        tasa_impuesto = Decimal('0.19')
+        impuestos = subtotal * tasa_impuesto
+        total = subtotal + impuestos
+        
+        # Actualizar factura
+        update_query = """
+        UPDATE facturas 
+        SET subtotal_factura = %s, impuestos_factura = %s, total_factura = %s
+        WHERE id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(update_query, (subtotal, impuestos, total, factura_id))
+                conn.commit()
+    
+    def confirmar_factura(self, factura_id):
+        """
+        Confirmar una factura (cambiar de borrador a confirmada)
+        
+        Args:
+            factura_id (int): ID de la factura
+        """
+        factura = self.obtener_por_id(factura_id)
+        if not factura:
+            raise FacturaError("La factura no existe")
+        
+        if factura['estado'] != 'borrador':
+            raise FacturaError("Solo se pueden confirmar facturas en estado borrador")
+        
+        # Validar que tenga al menos un detalle
+        detalles = self.obtener_detalles(factura_id)
+        if not detalles:
+            raise FacturaError("La factura debe tener al menos un producto")
+        
+        # Validar stock para todos los productos
+        for detalle in detalles:
+            producto = self.obtener_producto(detalle['producto_id'])
+            if producto['stock_actual'] < detalle['cantidad']:
+                raise FacturaError(f"Stock insuficiente para {producto['nombre']}")
+        
+        # Actualizar stock de productos
+        for detalle in detalles:
+            self.actualizar_stock_producto(detalle['producto_id'], -detalle['cantidad'])
+        
+        # Cambiar estado de la factura
+        query = "UPDATE facturas SET estado = 'confirmada' WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id,))
+                conn.commit()
+    
+    def anular_factura(self, factura_id, motivo=None):
+        """
+        Anular una factura
+        
+        Args:
+            factura_id (int): ID de la factura
+            motivo (str): Motivo de anulación
+        """
+        factura = self.obtener_por_id(factura_id)
+        if not factura:
+            raise FacturaError("La factura no existe")
+        
+        if factura['estado'] == 'anulada':
+            raise FacturaError("La factura ya está anulada")
+        
+        # Si la factura estaba confirmada, devolver stock
+        if factura['estado'] == 'confirmada':
+            detalles = self.obtener_detalles(factura_id)
+            for detalle in detalles:
+                self.actualizar_stock_producto(detalle['producto_id'], detalle['cantidad'])
+        
+        # Actualizar estado
+        query = """
+        UPDATE facturas 
+        SET estado = 'anulada', observaciones = CONCAT(COALESCE(observaciones, ''), %s)
+        WHERE id = %s
+        """
+        
+        motivo_texto = f"\n[ANULADA] {motivo}" if motivo else "\n[ANULADA]"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (motivo_texto, factura_id))
+                conn.commit()
+    
+    def obtener_por_id(self, factura_id):
+        """Obtener factura por ID"""
+        query = """
+        SELECT f.*, c.nombre_completo as cliente_nombre
+        FROM facturas f
+        JOIN clientes c ON f.cliente_id = c.id
+        WHERE f.id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id,))
+                return cursor.fetchone()
+    
+    def obtener_todas(self, filtros=None):
+        """
+        Obtener lista de facturas con filtros opcionales
+        
+        Args:
+            filtros (dict): Filtros opcionales (cliente_id, estado, fecha_desde, fecha_hasta)
+        """
+        base_query = """
+        SELECT f.*, c.nombre_completo as cliente_nombre
+        FROM facturas f
+        JOIN clientes c ON f.cliente_id = c.id
+        WHERE 1=1
+        """
+        
+        params = []
+        
+        if filtros:
+            if filtros.get('cliente_id'):
+                base_query += " AND f.cliente_id = %s"
+                params.append(filtros['cliente_id'])
+            
+            if filtros.get('estado'):
+                base_query += " AND f.estado = %s"
+                params.append(filtros['estado'])
+            
+            if filtros.get('fecha_desde'):
+                base_query += " AND f.fecha_factura >= %s"
+                params.append(filtros['fecha_desde'])
+            
+            if filtros.get('fecha_hasta'):
+                base_query += " AND f.fecha_factura <= %s"
+                params.append(filtros['fecha_hasta'])
+            
+            if filtros.get('numero_factura'):
+                base_query += " AND f.numero_factura LIKE %s"
+                params.append(f"%{filtros['numero_factura']}%")
+        
+        base_query += " ORDER BY f.fecha_factura DESC, f.id DESC"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(base_query, params)
+                return cursor.fetchall()
+    
+    def obtener_detalles(self, factura_id):
+        """Obtener detalles de una factura"""
+        query = """
+        SELECT fd.*, p.nombre as producto_nombre, p.codigo as producto_codigo
+        FROM factura_detalles fd
+        JOIN productos p ON fd.producto_id = p.id
+        WHERE fd.factura_id = %s
+        ORDER BY fd.id
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id,))
+                return cursor.fetchall()
+    
+    def obtener_detalle_por_id(self, detalle_id):
+        """Obtener un detalle específico por ID"""
+        query = "SELECT * FROM factura_detalles WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (detalle_id,))
+                return cursor.fetchone()
+    
+    def obtener_detalle_producto(self, factura_id, producto_id):
+        """Obtener detalle de un producto específico en una factura"""
+        query = """
+        SELECT * FROM factura_detalles 
+        WHERE factura_id = %s AND producto_id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (factura_id, producto_id))
+                return cursor.fetchone()
+    
+    def generar_numero_factura(self):
+        """Generar número de factura único"""
+        query = """
+        SELECT COALESCE(MAX(CAST(SUBSTRING(numero_factura, 2) AS UNSIGNED)), 0) + 1 as siguiente
+        FROM facturas 
+        WHERE numero_factura REGEXP '^F[0-9]+$'
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                result = cursor.fetchone()
+                return f"F{result['siguiente']:06d}"
+    
+    def cliente_existe(self, cliente_id):
+        """Verificar si un cliente existe"""
+        query = "SELECT COUNT(*) as count FROM clientes WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (cliente_id,))
+                result = cursor.fetchone()
+                return result['count'] > 0
+    
+    def obtener_producto(self, producto_id):
+        """Obtener información de un producto"""
+        query = "SELECT * FROM productos WHERE id = %s"
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (producto_id,))
+                return cursor.fetchone()
+    
+    def actualizar_stock_producto(self, producto_id, cambio_cantidad):
+        """
+        Actualizar stock de un producto
+        
+        Args:
+            producto_id (int): ID del producto
+            cambio_cantidad (int): Cantidad a sumar/restar (negativo para restar)
+        """
+        query = """
+        UPDATE productos 
+        SET stock_actual = stock_actual + %s
+        WHERE id = %s
+        """
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (cambio_cantidad, producto_id))
+                conn.commit()
+    
+    def obtener_estadisticas_ventas(self, fecha_desde=None, fecha_hasta=None):
+        """
+        Obtener estadísticas de ventas
+        
+        Args:
+            fecha_desde (date): Fecha de inicio
+            fecha_hasta (date): Fecha de fin
+            
+        Returns:
+            dict: Estadísticas de ventas
+        """
+        base_query = """
+        SELECT 
+            COUNT(*) as total_facturas,
+            COALESCE(SUM(total_factura), 0) as total_ventas,
+            COALESCE(AVG(total_factura), 0) as promedio_venta,
+            COUNT(CASE WHEN estado = 'confirmada' THEN 1 END) as facturas_confirmadas,
+            COUNT(CASE WHEN estado = 'borrador' THEN 1 END) as facturas_borrador,
+            COUNT(CASE WHEN estado = 'anulada' THEN 1 END) as facturas_anuladas
+        FROM facturas
+        WHERE 1=1
+        """
+        
+        params = []
+        
+        if fecha_desde:
+            base_query += " AND fecha_factura >= %s"
+            params.append(fecha_desde)
+        
+        if fecha_hasta:
+            base_query += " AND fecha_factura <= %s"
+            params.append(fecha_hasta)
+        
+        with self.db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(base_query, params)
+                return cursor.fetchone()
+```
+
+### Implementación del Controlador
+
+#### controllers/factura_controller.py
+```python
+from models.factura import Factura
+from utils.exceptions import FacturaError
+from PyQt5.QtCore import QObject, pyqtSignal
+
+class FacturaController(QObject):
+    # Señales para comunicación con la vista
+    factura_creada = pyqtSignal(dict)
+    factura_actualizada = pyqtSignal(dict)
+    detalle_agregado = pyqtSignal(dict)
+    detalle_eliminado = pyqtSignal(int)
+    factura_confirmada = pyqtSignal(int)
+    factura_anulada = pyqtSignal(int)
+    error_ocurrido = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.modelo = Factura()
+    
+    def crear_factura(self, cliente_id, observaciones=None):
+        """Crear nueva factura"""
+        try:
+            factura_id = self.modelo.crear(cliente_id, observaciones)
+            factura_creada = self.modelo.obtener_por_id(factura_id)
+            self.factura_creada.emit(factura_creada)
+            return factura_id
+            
+        except FacturaError as e:
+            self.error_ocurrido.emit(str(e))
+            return None
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+            return None
+    
+    def obtener_facturas(self, filtros=None):
+        """Obtener lista de facturas"""
+        try:
+            return self.modelo.obtener_todas(filtros)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener facturas: {str(e)}")
+            return []
+    
+    def obtener_factura(self, factura_id):
+        """Obtener factura específica"""
+        try:
+            return self.modelo.obtener_por_id(factura_id)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener factura: {str(e)}")
+            return None
+    
+    def obtener_detalles_factura(self, factura_id):
+        """Obtener detalles de una factura"""
+        try:
+            return self.modelo.obtener_detalles(factura_id)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener detalles: {str(e)}")
+            return []
+    
+    def agregar_producto(self, factura_id, producto_id, cantidad, precio_unitario=None):
+        """Agregar producto a factura"""
+        try:
+            self.modelo.agregar_detalle(factura_id, producto_id, cantidad, precio_unitario)
+            
+            # Obtener el detalle agregado para emitir señal
+            detalle = self.modelo.obtener_detalle_producto(factura_id, producto_id)
+            self.detalle_agregado.emit(detalle)
+            
+            # Emitir señal de factura actualizada
+            factura_actualizada = self.modelo.obtener_por_id(factura_id)
+            self.factura_actualizada.emit(factura_actualizada)
+            
+        except FacturaError as e:
+            self.error_ocurrido.emit(str(e))
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+    
+    def eliminar_detalle(self, detalle_id):
+        """Eliminar detalle de factura"""
+        try:
+            # Obtener información del detalle antes de eliminarlo
+            detalle = self.modelo.obtener_detalle_por_id(detalle_id)
+            if not detalle:
+                self.error_ocurrido.emit("El detalle no existe")
+                return
+            
+            factura_id = detalle['factura_id']
+            
+            self.modelo.eliminar_detalle(detalle_id)
+            self.detalle_eliminado.emit(detalle_id)
+            
+            # Emitir señal de factura actualizada
+            factura_actualizada = self.modelo.obtener_por_id(factura_id)
+            self.factura_actualizada.emit(factura_actualizada)
+            
+        except FacturaError as e:
+            self.error_ocurrido.emit(str(e))
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+    
+    def confirmar_factura(self, factura_id):
+        """Confirmar factura"""
+        try:
+            self.modelo.confirmar_factura(factura_id)
+            self.factura_confirmada.emit(factura_id)
+            
+            # Emitir señal de factura actualizada
+            factura_actualizada = self.modelo.obtener_por_id(factura_id)
+            self.factura_actualizada.emit(factura_actualizada)
+            
+        except FacturaError as e:
+            self.error_ocurrido.emit(str(e))
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+    
+    def anular_factura(self, factura_id, motivo=None):
+        """Anular factura"""
+        try:
+            self.modelo.anular_factura(factura_id, motivo)
+            self.factura_anulada.emit(factura_id)
+            
+            # Emitir señal de factura actualizada
+            factura_actualizada = self.modelo.obtener_por_id(factura_id)
+            self.factura_actualizada.emit(factura_actualizada)
+            
+        except FacturaError as e:
+            self.error_ocurrido.emit(str(e))
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error inesperado: {str(e)}")
+    
+    def obtener_estadisticas_ventas(self, fecha_desde=None, fecha_hasta=None):
+        """Obtener estadísticas de ventas"""
+        try:
+            return self.modelo.obtener_estadisticas_ventas(fecha_desde, fecha_hasta)
+        except Exception as e:
+            self.error_ocurrido.emit(f"Error al obtener estadísticas: {str(e)}")
+            return None
+```
+
+### Implementación de la Vista Principal
+
+#### views/facturas_view.py
+```python
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+                            QTableWidget, QTableWidgetItem, QLineEdit, QLabel,
+                            QComboBox, QDateEdit, QMessageBox, QHeaderView,
+                            QAbstractItemView, QSplitter, QGroupBox, QFormLayout)
+from PyQt5.QtCore import Qt, pyqtSlot, QDate
+from controllers.factura_controller import FacturaController
+from views.factura_dialog import FacturaDialog
+
+class FacturasView(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.controller = FacturaController()
+        self.setup_ui()
+        self.conectar_senales()
+        self.cargar_facturas()
+    
+    def setup_ui(self):
+        """Configurar interfaz de usuario"""
+        layout = QVBoxLayout()
+        
+        # Filtros
+        filtros_group = QGroupBox("Filtros de Búsqueda")
+        filtros_layout = QFormLayout()
+        
+        self.combo_estado = QComboBox()
+        self.combo_estado.addItems(['Todos', 'Borrador', 'Confirmada', 'Anulada'])
+        
+        self.txt_numero = QLineEdit()
+        self.txt_numero.setPlaceholderText("Número de factura...")
+        
+        self.date_desde = QDateEdit()
+        self.date_desde.setDate(QDate.currentDate().addDays(-30))
+        self.date_desde.setCalendarPopup(True)
+        
+        self.date_hasta = QDateEdit()
+        self.date_hasta.setDate(QDate.currentDate())
+        self.date_hasta.setCalendarPopup(True)
+        
+        self.btn_filtrar = QPushButton("Filtrar")
+        self.btn_limpiar_filtros = QPushButton("Limpiar")
+        
+        filtros_layout.addRow("Estado:", self.combo_estado)
+        filtros_layout.addRow("Número:", self.txt_numero)
+        filtros_layout.addRow("Desde:", self.date_desde)
+        filtros_layout.addRow("Hasta:", self.date_hasta)
+        
+        botones_filtros = QHBoxLayout()
+        botones_filtros.addWidget(self.btn_filtrar)
+        botones_filtros.addWidget(self.btn_limpiar_filtros)
+        botones_filtros.addStretch()
+        
+        filtros_layout.addRow("", botones_filtros)
+        filtros_group.setLayout(filtros_layout)
+        
+        # Barra de herramientas
+        toolbar_layout = QHBoxLayout()
+        
+        self.btn_nueva = QPushButton("Nueva Factura")
+        self.btn_ver = QPushButton("Ver/Editar")
+        self.btn_confirmar = QPushButton("Confirmar")
+        self.btn_anular = QPushButton("Anular")
+        self.btn_imprimir = QPushButton("Imprimir")
+        self.btn_actualizar = QPushButton("Actualizar")
+        
+        toolbar_layout.addWidget(self.btn_nueva)
+        toolbar_layout.addWidget(self.btn_ver)
+        toolbar_layout.addWidget(self.btn_confirmar)
+        toolbar_layout.addWidget(self.btn_anular)
+        toolbar_layout.addWidget(self.btn_imprimir)
+        toolbar_layout.addWidget(self.btn_actualizar)
+        toolbar_layout.addStretch()
+        
+        # Tabla de facturas
+        self.tabla_facturas = QTableWidget()
+        self.configurar_tabla()
+        
+        # Layout principal
+        layout.addWidget(filtros_group)
+        layout.addLayout(toolbar_layout)
+        layout.addWidget(self.tabla_facturas)
+        
+        self.setLayout(layout)
+        
+        # Estado inicial de botones
+        self.btn_ver.setEnabled(False)
+        self.btn_confirmar.setEnabled(False)
+        self.btn_anular.setEnabled(False)
+        self.btn_imprimir.setEnabled(False)
+    
+    def configurar_tabla(self):
+        """Configurar tabla de facturas"""
+        columnas = ['ID', 'Número', 'Cliente', 'Fecha', 'Subtotal', 
+                   'Impuestos', 'Total', 'Estado']
+        self.tabla_facturas.setColumnCount(len(columnas))
+        self.tabla_facturas.setHorizontalHeaderLabels(columnas)
+        
+        # Configurar comportamiento
+        self.tabla_facturas.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tabla_facturas.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tabla_facturas.setAlternatingRowColors(True)
+        
+        # Ajustar columnas
+        header = self.tabla_facturas.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # ID
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Número
+        header.setSectionResizeMode(2, QHeaderView.Stretch)           # Cliente
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Fecha
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Subtotal
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Impuestos
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Total
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # Estado
+        
+        # Ocultar columna ID
+        self.tabla_facturas.setColumnHidden(0, True)
+    
+    def conectar_senales(self):
+        """Conectar señales y slots"""
+        # Botones
+        self.btn_nueva.clicked.connect(self.nueva_factura)
+        self.btn_ver.clicked.connect(self.ver_factura)
+        self.btn_confirmar.clicked.connect(self.confirmar_factura)
+        self.btn_anular.clicked.connect(self.anular_factura)
+        self.btn_imprimir.clicked.connect(self.imprimir_factura)
+        self.btn_actualizar.clicked.connect(self.cargar_facturas)
+        
+        # Filtros
+        self.btn_filtrar.clicked.connect(self.aplicar_filtros)
+        self.btn_limpiar_filtros.clicked.connect(self.limpiar_filtros)
+        
+        # Tabla
+        self.tabla_facturas.itemSelectionChanged.connect(self.seleccion_cambiada)
+        self.tabla_facturas.itemDoubleClicked.connect(self.ver_factura)
+        
+        # Señales del controlador
+        self.controller.factura_creada.connect(self.on_factura_creada)
+        self.controller.factura_actualizada.connect(self.on_factura_actualizada)
+        self.controller.factura_confirmada.connect(self.on_factura_confirmada)
+        self.controller.factura_anulada.connect(self.on_factura_anulada)
+        self.controller.error_ocurrido.connect(self.mostrar_error)
+    
+    def cargar_facturas(self):
+        """Cargar facturas en la tabla"""
+        filtros = self.obtener_filtros()
+        facturas = self.controller.obtener_facturas(filtros)
+        
+        self.tabla_facturas.setRowCount(len(facturas))
+        
+        for row, factura in enumerate(facturas):
+            items = [
+                str(factura['id']),
+                factura['numero_factura'],
+                factura['cliente_nombre'],
+                factura['fecha_factura'].strftime('%Y-%m-%d'),
+                f"${factura['subtotal_factura']:.2f}",
+                f"${factura['impuestos_factura']:.2f}",
+                f"${factura['total_factura']:.2f}",
+                factura['estado'].replace('_', ' ').title()
+            ]
+            
+            for col, item in enumerate(items):
+                table_item = QTableWidgetItem(str(item))
+                table_item.setFlags(table_item.flags() & ~Qt.ItemIsEditable)
+                
+                # Colorear según estado
+                if factura['estado'] == 'borrador':
+                    table_item.setBackground(Qt.yellow)
+                elif factura['estado'] == 'confirmada':
+                    table_item.setBackground(Qt.green)
+                elif factura['estado'] == 'anulada':
+                    table_item.setBackground(Qt.red)
+                
+                self.tabla_facturas.setItem(row, col, table_item)
+    
+    def obtener_filtros(self):
+        """Obtener filtros actuales"""
+        filtros = {}
+        
+        if self.combo_estado.currentText() != 'Todos':
+            filtros['estado'] = self.combo_estado.currentText().lower()
+        
+        if self.txt_numero.text().strip():
+            filtros['numero_factura'] = self.txt_numero.text().strip()
+        
+        filtros['fecha_desde'] = self.date_desde.date().toPyDate()
+        filtros['fecha_hasta'] = self.date_hasta.date().toPyDate()
+        
+        return filtros
+    
+    def seleccion_cambiada(self):
+        """Manejar cambio de selección"""
+        tiene_seleccion = len(self.tabla_facturas.selectedItems()) > 0
+        self.btn_ver.setEnabled(tiene_seleccion)
+        self.btn_imprimir.setEnabled(tiene_seleccion)
+        
+        if tiene_seleccion:
+            factura_id = self.obtener_factura_seleccionada()
+            factura = self.controller.obtener_factura(factura_id)
+            
+            if factura:
+                # Habilitar botones según estado
+                self.btn_confirmar.setEnabled(factura['estado'] == 'borrador')
+                self.btn_anular.setEnabled(factura['estado'] in ['borrador', 'confirmada'])
+            else:
+                self.btn_confirmar.setEnabled(False)
+                self.btn_anular.setEnabled(False)
+        else:
+            self.btn_confirmar.setEnabled(False)
+            self.btn_anular.setEnabled(False)
+    
+    def obtener_factura_seleccionada(self):
+        """Obtener ID de factura seleccionada"""
+        fila_actual = self.tabla_facturas.currentRow()
+        if fila_actual >= 0:
+            return int(self.tabla_facturas.item(fila_actual, 0).text())
+        return None
+    
+    def nueva_factura(self):
+        """Crear nueva factura"""
+        dialogo = FacturaDialog(self)
+        dialogo.exec_()
+    
+    def ver_factura(self):
+        """Ver/editar factura seleccionada"""
+        factura_id = self.obtener_factura_seleccionada()
+        if factura_id:
+            dialogo = FacturaDialog(self, factura_id)
+            dialogo.exec_()
+    
+    def confirmar_factura(self):
+        """Confirmar factura seleccionada"""
+        factura_id = self.obtener_factura_seleccionada()
+        if factura_id:
+            respuesta = QMessageBox.question(
+                self,
+                "Confirmar Factura",
+                "¿Está seguro de que desea confirmar esta factura?\n"
+                "Esta acción actualizará el stock de productos.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if respuesta == QMessageBox.Yes:
+                self.controller.confirmar_factura(factura_id)
+    
+    def anular_factura(self):
+        """Anular factura seleccionada"""
+        factura_id = self.obtener_factura_seleccionada()
+        if factura_id:
+            from PyQt5.QtWidgets import QInputDialog
+            
+            motivo, ok = QInputDialog.getText(
+                self,
+                "Anular Factura",
+                "Ingrese el motivo de anulación:"
+            )
+            
+            if ok:
+                self.controller.anular_factura(factura_id, motivo)
+    
+    def imprimir_factura(self):
+        """Imprimir factura seleccionada"""
+        factura_id = self.obtener_factura_seleccionada()
+        if factura_id:
+            # TODO: Implementar generación de PDF
+            QMessageBox.information(self, "Información", "Función de impresión en desarrollo")
+    
+    def aplicar_filtros(self):
+        """Aplicar filtros de búsqueda"""
+        self.cargar_facturas()
+    
+    def limpiar_filtros(self):
+        """Limpiar filtros de búsqueda"""
+        self.combo_estado.setCurrentIndex(0)
+        self.txt_numero.clear()
+        self.date_desde.setDate(QDate.currentDate().addDays(-30))
+        self.date_hasta.setDate(QDate.currentDate())
+        self.cargar_facturas()
+    
+    @pyqtSlot(dict)
+    def on_factura_creada(self, factura):
+        """Manejar factura creada"""
+        QMessageBox.information(self, "Éxito", "Factura creada correctamente")
+        self.cargar_facturas()
+    
+    @pyqtSlot(dict)
+    def on_factura_actualizada(self, factura):
+        """Manejar factura actualizada"""
+        self.cargar_facturas()
+    
+    @pyqtSlot(int)
+    def on_factura_confirmada(self, factura_id):
+        """Manejar factura confirmada"""
+        QMessageBox.information(self, "Éxito", "Factura confirmada correctamente")
+        self.cargar_facturas()
+    
+    @pyqtSlot(int)
+    def on_factura_anulada(self, factura_id):
+        """Manejar factura anulada"""
+        QMessageBox.information(self, "Éxito", "Factura anulada correctamente")
+        self.cargar_facturas()
+    
+    @pyqtSlot(str)
+    def mostrar_error(self, mensaje):
+        """Mostrar mensaje de error"""
+        QMessageBox.critical(self, "Error", mensaje)
+```
+
+---
+
 ## Configuración del Entorno de Desarrollo
 
 ### Requisitos Previos
