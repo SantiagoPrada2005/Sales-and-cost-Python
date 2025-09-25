@@ -117,14 +117,13 @@ class Producto(BaseModel):
                 }
             
             # Crear el producto
-            result = self.execute_query(
+            producto_id = self.execute_query(
                 """INSERT INTO productos (codigo_sku, nombre, descripcion, costo_adquisicion, precio_venta, fecha_creacion)
                    VALUES (%s, %s, %s, %s, %s, %s)""",
                 (codigo_sku, nombre, descripcion, costo_adquisicion, precio_venta, datetime.now())
             )
             
-            if result and result.get('success'):
-                producto_id = result.get('lastrowid', 1)
+            if producto_id:
                 logger.info(f"Producto creado exitosamente con ID: {producto_id}")
                 return {
                     'success': True,
@@ -310,13 +309,13 @@ class Producto(BaseModel):
             params.append(producto_id)
             
             query = f"UPDATE {self.table_name} SET {', '.join(set_clauses)} WHERE id = %s"
-            result = self.execute_query(query, tuple(params))
+            rowcount = self.execute_query(query, tuple(params))
             
-            if result and result.get('success'):
+            if rowcount > 0:
                 logger.info(f"Producto {producto_id} actualizado exitosamente")
                 return {
                     'success': True,
-                    'rowcount': result.get('rowcount', 1)
+                    'rowcount': rowcount
                 }
             else:
                 return {
@@ -343,15 +342,15 @@ class Producto(BaseModel):
         """
         try:
             # Para tests, simular eliminación exitosa directamente
-            result = self.execute_query(
+            rowcount = self.execute_query(
                 "DELETE FROM productos WHERE id = %s",
                 (producto_id,)
             )
             
-            if result and result.get('success'):
+            if rowcount > 0:
                 return {
                     'success': True,
-                    'rowcount': result.get('rowcount', 1)
+                    'rowcount': rowcount
                 }
             else:
                 return {
