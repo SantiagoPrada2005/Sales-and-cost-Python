@@ -13,11 +13,6 @@ El sistema propuesto utiliza una arquitectura de escritorio tradicional con las 
 - **Base de Datos:** MySQL con mysql-connector-python o PyMySQL
 - **Patrón de Diseño:** MVC (Modelo-Vista-Controlador) implícito
 
-
-
-
-
-
 **Módulos Principales:**
 1. Gestión de Productos (CRUD básico)
 2. Gestión de Clientes (CRUD básico) 
