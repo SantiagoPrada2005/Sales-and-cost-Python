@@ -2,7 +2,7 @@
 
 # Interfaz gráfica
 PyQt5==5.15.10
-PyQt5-Qt5==5.15.2
+PyQt5-Qt5>=5.15.11
 PyQt5-sip==12.13.0
 
 # Base de datos
@@ -10,7 +10,7 @@ PyMySQL==1.1.0
 cryptography==41.0.7
 
 # Manejo de datos
-python-decimal==0.1.0
+# python-decimal==0.1.0  # Comentado - no disponible, usar decimal nativo de Python
 
 # Fechas y tiempo
 python-dateutil==2.8.2
