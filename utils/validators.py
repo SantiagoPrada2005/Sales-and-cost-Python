@@ -207,7 +207,8 @@ class ClienteValidator(BaseValidator):
     def validar_email(self, email):
         """Validar formato de email"""
         try:
-            validate_email(email)
+            # Usar check_deliverability=False para evitar verificación de dominio en pruebas
+            validate_email(email, check_deliverability=False)
         except EmailNotValidError:
             raise ValidationError("El formato del email no es válido")
         

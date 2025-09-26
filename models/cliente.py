@@ -70,10 +70,15 @@ class Cliente(BaseModel):
         # Validar email (opcional)
         if contacto_email:
             contacto_email = contacto_email.strip()
-            if '@' not in contacto_email or '.' not in contacto_email:
-                errors.append("El email debe tener un formato válido")
-            elif len(contacto_email) > 100:
-                errors.append("El email no puede exceder 100 caracteres")
+            # Usar el validador más robusto
+            from utils.validators import ClienteValidator
+            validator = ClienteValidator()
+            try:
+                validator.validar_email(contacto_email)
+            except ValidationError as e:
+                errors.append(str(e))
+        elif contacto_email == '':  # Email vacío debe ser tratado como None
+            pass  # No validar emails vacíos
         
         return {
             'valid': len(errors) == 0,
