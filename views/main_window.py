@@ -9,6 +9,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
 from views.productos_view import ProductosView
 from views.clientes_view import ClientesView
+from views.facturas_view import FacturasView
 import logging
 
 logger = logging.getLogger(__name__)
@@ -71,8 +72,11 @@ class MainWindow(QMainWindow):
         self.clientes_view = ClientesView()
         self.tabs.addTab(self.clientes_view, "👥 Clientes")
         
+        # Pestaña de Facturación
+        self.facturas_view = FacturasView()
+        self.tabs.addTab(self.facturas_view, "🧾 Facturación")
+        
         # Pestañas placeholder para futuros módulos
-        self.setup_placeholder_tab("🧾 Facturación", "Módulo de facturación y ventas")
         self.setup_placeholder_tab("💰 Cuentas Pendientes", "Módulo de cuentas por cobrar")
         self.setup_placeholder_tab("📊 Reportes", "Módulo de reportes y estadísticas")
         

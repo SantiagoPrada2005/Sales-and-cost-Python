@@ -278,7 +278,33 @@ class ClienteValidator(BaseValidator):
 class FacturaValidator(BaseValidator):
     """Validador para facturas"""
     
-    def validar_detalle_factura(self, cantidad, precio_unitario):
+    def validar_factura_completa(self, cliente_id, observaciones=None, detalles=None):
+        """Validar datos completos de una factura"""
+        # Validar cliente
+        self.validate_required(cliente_id, "Cliente")
+        self.validate_integer(cliente_id, "Cliente ID", 1)
+        
+        # Validar observaciones
+        if observaciones:
+            self.validar_observaciones(observaciones)
+        
+        # Validar que tenga al menos un detalle
+        if detalles is not None:
+            if not detalles or len(detalles) == 0:
+                raise ValidationError("La factura debe tener al menos un producto")
+            
+            # Validar cada detalle
+            for i, detalle in enumerate(detalles):
+                try:
+                    self.validar_detalle_factura(
+                        detalle.get('cantidad'),
+                        detalle.get('precio_unitario'),
+                        detalle.get('producto_id')
+                    )
+                except ValidationError as e:
+                    raise ValidationError(f"Error en producto {i+1}: {str(e)}")
+    
+    def validar_detalle_factura(self, cantidad, precio_unitario, producto_id=None):
         """Validar detalle de factura"""
         # Validar cantidad
         self.validate_integer(cantidad, "Cantidad", 1, VALIDATION_CONFIG['max_quantity'])
@@ -290,11 +316,80 @@ class FacturaValidator(BaseValidator):
             VALIDATION_CONFIG['min_price'], 
             VALIDATION_CONFIG['max_price']
         )
+        
+        # Validar producto ID si se proporciona
+        if producto_id is not None:
+            self.validate_integer(producto_id, "Producto ID", 1)
+    
+    def validar_numero_factura(self, numero_factura):
+        """Validar formato del número de factura"""
+        self.validate_required(numero_factura, "Número de factura")
+        self.validate_length(numero_factura, "Número de factura", 20, 3)
+        
+        # Validar formato (letras, números y guiones)
+        if not re.match(r'^[A-Za-z0-9-]+$', numero_factura):
+            raise ValidationError("El número de factura solo puede contener letras, números y guiones")
+    
+    def validar_estado_factura(self, estado):
+        """Validar que el estado de la factura sea válido"""
+        estados_validos = ['borrador', 'confirmada', 'anulada']
+        if estado not in estados_validos:
+            raise ValidationError(f"Estado de factura inválido. Estados válidos: {', '.join(estados_validos)}")
+    
+    def validar_cambio_estado(self, estado_actual, nuevo_estado):
+        """Validar que el cambio de estado sea válido"""
+        transiciones_validas = {
+            'borrador': ['confirmada', 'anulada'],
+            'confirmada': ['anulada'],
+            'anulada': []  # No se puede cambiar desde anulada
+        }
+        
+        if nuevo_estado not in transiciones_validas.get(estado_actual, []):
+            raise ValidationError(f"No se puede cambiar de estado '{estado_actual}' a '{nuevo_estado}'")
+    
+    def validar_totales_factura(self, subtotal, impuestos, total):
+        """Validar que los totales de la factura sean correctos"""
+        # Validar que sean números positivos
+        self.validate_decimal(subtotal, "Subtotal", 0)
+        self.validate_decimal(impuestos, "Impuestos", 0)
+        self.validate_decimal(total, "Total", 0)
+        
+        # Validar que el total sea la suma del subtotal e impuestos
+        subtotal_decimal = Decimal(str(subtotal))
+        impuestos_decimal = Decimal(str(impuestos))
+        total_decimal = Decimal(str(total))
+        
+        total_calculado = subtotal_decimal + impuestos_decimal
+        
+        # Permitir una pequeña diferencia por redondeo
+        diferencia = abs(total_decimal - total_calculado)
+        if diferencia > Decimal('0.01'):
+            raise ValidationError("El total no coincide con la suma del subtotal e impuestos")
     
     def validar_observaciones(self, observaciones):
         """Validar observaciones de factura"""
         if observaciones:
             self.validate_length(observaciones, "Observaciones", VALIDATION_CONFIG['max_description_length'])
+    
+    def validar_stock_disponible(self, producto_id, cantidad_solicitada, stock_actual):
+        """Validar que hay suficiente stock para la cantidad solicitada"""
+        if stock_actual < cantidad_solicitada:
+            raise ValidationError(f"Stock insuficiente. Disponible: {stock_actual}, Solicitado: {cantidad_solicitada}")
+    
+    def validar_actualizacion_detalle(self, detalle_id, nueva_cantidad=None, nuevo_precio=None):
+        """Validar actualización de detalle de factura"""
+        self.validate_integer(detalle_id, "ID del detalle", 1)
+        
+        if nueva_cantidad is not None:
+            self.validate_integer(nueva_cantidad, "Nueva cantidad", 1, VALIDATION_CONFIG['max_quantity'])
+        
+        if nuevo_precio is not None:
+            self.validate_decimal(
+                nuevo_precio, 
+                "Nuevo precio", 
+                VALIDATION_CONFIG['min_price'], 
+                VALIDATION_CONFIG['max_price']
+            )
 
 class PagoValidator(BaseValidator):
     """Validador para pagos"""
