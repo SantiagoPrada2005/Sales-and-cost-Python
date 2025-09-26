@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QIcon, QPalette, QColor
 from views.productos_view import ProductosView
+from views.clientes_view import ClientesView
 import logging
 
 logger = logging.getLogger(__name__)
@@ -66,8 +67,11 @@ class MainWindow(QMainWindow):
         self.productos_view = ProductosView()
         self.tabs.addTab(self.productos_view, "📦 Productos")
         
+        # Pestaña de Clientes
+        self.clientes_view = ClientesView()
+        self.tabs.addTab(self.clientes_view, "👥 Clientes")
+        
         # Pestañas placeholder para futuros módulos
-        self.setup_placeholder_tab("👥 Clientes", "Módulo de gestión de clientes")
         self.setup_placeholder_tab("🧾 Facturación", "Módulo de facturación y ventas")
         self.setup_placeholder_tab("💰 Cuentas Pendientes", "Módulo de cuentas por cobrar")
         self.setup_placeholder_tab("📊 Reportes", "Módulo de reportes y estadísticas")
@@ -159,6 +163,10 @@ class MainWindow(QMainWindow):
         # Conexiones con la vista de productos
         if hasattr(self.productos_view, 'producto_seleccionado'):
             self.productos_view.producto_seleccionado.connect(self.on_producto_seleccionado)
+        
+        # Conexiones con la vista de clientes
+        if hasattr(self.clientes_view, 'cliente_seleccionado'):
+            self.clientes_view.cliente_seleccionado.connect(self.on_cliente_seleccionado)
     
     def apply_styles(self):
         """Aplicar estilos a la ventana"""
@@ -196,6 +204,10 @@ class MainWindow(QMainWindow):
             if hasattr(self.productos_view, 'cargar_productos'):
                 self.productos_view.cargar_productos()
                 self.status_bar.showMessage("Productos actualizados", 2000)
+        elif current_widget == self.clientes_view:
+            if hasattr(self.clientes_view, 'cargar_clientes'):
+                self.clientes_view.cargar_clientes()
+                self.status_bar.showMessage("Clientes actualizados", 2000)
         else:
             self.status_bar.showMessage("Actualización no disponible para esta pestaña", 2000)
     
@@ -219,6 +231,12 @@ class MainWindow(QMainWindow):
         """Manejar selección de producto"""
         if producto:
             mensaje = f"Producto seleccionado: {producto.get('nombre', 'Sin nombre')}"
+            self.status_bar.showMessage(mensaje, 3000)
+    
+    def on_cliente_seleccionado(self, cliente):
+        """Manejar selección de cliente"""
+        if cliente:
+            mensaje = f"Cliente seleccionado: {cliente.get('nombre', 'Sin nombre')}"
             self.status_bar.showMessage(mensaje, 3000)
     
     def mostrar_acerca_de(self):
